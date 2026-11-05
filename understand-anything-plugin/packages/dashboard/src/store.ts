@@ -246,6 +246,20 @@ function getSortedTour(graph: KnowledgeGraph): TourStep[] {
 }
 
 /** Navigate tour step to the correct layer for the first highlighted node. */
+/**
+ * Collapsed boxes are compact and expanded ones take their measured size, so
+ * Stage 1 must re-layout when a box changes size. A first expansion is left
+ * to Stage 2, which bumps the tick once it has measured the children.
+ */
+function resizeTick(
+  state: Pick<DashboardStore, "stage1Tick" | "containerLayoutCache">,
+  containerId: string,
+  willExpand: boolean,
+): number {
+  const sizeChangesNow = !willExpand || state.containerLayoutCache.has(containerId);
+  return sizeChangesNow ? state.stage1Tick + 1 : state.stage1Tick;
+}
+
 function navigateTourToLayer(
   nodeIdToLayerId: Map<string, string>,
   nodeIds: string[],
@@ -741,6 +755,7 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
       else next.delete(containerId);
       return {
         expandedContainers: next,
+        stage1Tick: resizeTick(state, containerId, willExpand),
         pendingFocusContainer: willExpand
           ? containerId
           : state.pendingFocusContainer,
@@ -751,16 +766,20 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
       if (state.expandedContainers.has(containerId)) return {};
       const next = new Set(state.expandedContainers);
       next.add(containerId);
-      return { expandedContainers: next };
+      return { expandedContainers: next, stage1Tick: resizeTick(state, containerId, true) };
     }),
   collapseContainer: (containerId) =>
     set((state) => {
       if (!state.expandedContainers.has(containerId)) return {};
       const next = new Set(state.expandedContainers);
       next.delete(containerId);
-      return { expandedContainers: next };
+      return { expandedContainers: next, stage1Tick: resizeTick(state, containerId, false) };
     }),
-  collapseAllContainers: () => set({ expandedContainers: new Set() }),
+  collapseAllContainers: () =>
+    set((state) => ({
+      expandedContainers: new Set(),
+      stage1Tick: state.expandedContainers.size > 0 ? state.stage1Tick + 1 : state.stage1Tick,
+    })),
 
   containerLayoutCache: new Map(),
   setContainerLayout: (containerId, childPositions, actualSize) =>

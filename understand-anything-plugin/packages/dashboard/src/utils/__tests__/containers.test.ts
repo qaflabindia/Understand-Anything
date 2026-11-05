@@ -189,6 +189,20 @@ describe("deriveContainers — oversized boxes split deeper", () => {
     expect(ungrouped).toEqual([]);
   });
 
+  it("names split boxes by their full folder path from the layer root", () => {
+    const nodes = [
+      ...many(12, (i) => `lixedin/server/src/routes/r${i}.ts`, "r"),
+      ...many(12, (i) => `lixedin/server/src/services/s${i}.ts`, "s"),
+      ...many(3, (i) => `lixedin/ui/src/u${i}.tsx`, "u"),
+    ];
+    const { containers } = deriveContainers(nodes, []);
+    expect(containers.map((c) => c.name).sort()).toEqual([
+      "server/src/routes",
+      "server/src/services",
+      "ui",
+    ]);
+  });
+
   it("leaves a big box whole when nothing divides it", () => {
     const nodes = [
       ...many(25, (i) => `handlers/${String.fromCharCode(97 + i)}x.ts`, "u"),

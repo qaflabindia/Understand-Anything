@@ -141,16 +141,32 @@ function bucket(nodes: GraphNode[], prefixDepth = 1): DerivedContainer[] {
   }));
 }
 
-function lastSegment(name: string): string {
-  return name.slice(name.lastIndexOf("/") + 1);
-}
-
 const OTHER_SUFFIX = " (other)";
 
-function childName(parent: DerivedContainer, child: DerivedContainer): string {
-  // A deeper prefix (grc-risk*) already spells out its parent (grc*).
-  if (parent.strategy === "prefix" && child.strategy === "prefix") return child.name;
-  const p = lastSegment(parent.name.replace(OTHER_SUFFIX, ""));
+/**
+ * Names keep the full folder path from the layer root (server/src/routes),
+ * so boxes from the same folder read as one tree. A sub-folder's path is
+ * read from its files, because bucketing skips folders every file shares
+ * (server/ holding only src/ would otherwise name server/src/routes as
+ * server/routes).
+ */
+function childName(
+  parent: DerivedContainer,
+  child: DerivedContainer,
+  byId: Map<string, GraphNode>,
+  root: string,
+): string {
+  const p = parent.name.replace(OTHER_SUFFIX, "");
+  if (child.strategy === "folder") {
+    const paths = child.nodeIds.flatMap((id) => byId.get(id)!.filePath ?? []);
+    const dir = paths.length > 0 ? commonPrefix(paths).slice(root.length).replace(/\/$/, "") : "";
+    if (dir) return dir;
+  }
+  // A deeper prefix (grc-risk*) replaces its parent prefix (grc*) in place.
+  if (parent.strategy === "prefix" && child.strategy === "prefix") {
+    const slash = p.lastIndexOf("/");
+    return slash >= 0 ? `${p.slice(0, slash)}/${child.name}` : child.name;
+  }
   if (p === ROOT_BUCKET) return child.name;
   // Files sitting directly in the parent folder are named after it.
   if (child.name === ROOT_BUCKET) return p;
@@ -171,6 +187,7 @@ function otherName(name: string): string {
 function splitOversized(
   container: DerivedContainer,
   byId: Map<string, GraphNode>,
+  root: string,
   prefixDepth: number,
 ): DerivedContainer[] {
   if (container.nodeIds.length <= MAX_CONTAINER_SIZE) return [container];
@@ -195,11 +212,12 @@ function splitOversized(
     splitOversized(
       {
         id: `${container.id}/${child.id.slice("container:".length)}`,
-        name: childName(container, child),
+        name: childName(container, child, byId, root),
         nodeIds: child.nodeIds,
         strategy: child.strategy,
       },
       byId,
+      root,
       nextDepth,
     ),
   );
@@ -232,8 +250,9 @@ export function deriveContainers(
   }
 
   const byId = new Map(nodes.map((n) => [n.id, n]));
+  const root = commonPrefix(nodes.filter((n) => n.filePath).map((n) => n.filePath!));
   let containers = mergeSameName(
-    bucket(nodes).flatMap((c) => splitOversized(c, byId, 1)),
+    bucket(nodes).flatMap((c) => splitOversized(c, byId, root, 1)),
   );
 
   // Suppress single-child containers (their child becomes ungrouped).

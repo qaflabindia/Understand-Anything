@@ -54,6 +54,10 @@ import { deriveContainers } from "../utils/containers";
 import type { DerivedContainer } from "../utils/containers";
 import { computeLayerStats } from "../utils/layerStats";
 
+const COLLAPSED_CONTAINER_WIDTH = LAYER_CLUSTER_WIDTH;
+const COLLAPSED_CONTAINER_HEIGHT = LAYER_CLUSTER_HEIGHT;
+const CONTAINER_PREVIEW_COUNT = 3;
+
 const nodeTypes = {
   custom: CustomNode,
   "layer-cluster": LayerClusterNode,
@@ -515,37 +519,26 @@ function useLayerDetailTopology(): LayerDetailTopology & {
       nodeToContainer,
     );
 
-    // Container size estimate (size memory takes priority).
-    // Caps prevent first-paint sprawl: at 100 children sqrt() yields
-    // ~3360px which renders as a huge empty box pre-expansion. Stage 2
-    // sets the actual size once it's measured, and Task 15 re-flows.
-    const STAGE1_MAX_CONTAINER_WIDTH = 800;
-    const STAGE1_MAX_CONTAINER_HEIGHT = 600;
-    const sizeMemory = useDashboardStore.getState().containerSizeMemory;
-    const containerWidth = (c: DerivedContainer) => {
-      const memo = sizeMemory.get(c.id)?.width;
-      if (memo) return memo;
-      const estimate = Math.sqrt(c.nodeIds.length) * NODE_WIDTH * 1.2;
-      return Math.min(STAGE1_MAX_CONTAINER_WIDTH, Math.max(NODE_WIDTH, estimate));
-    };
-    const containerHeight = (c: DerivedContainer) => {
-      const memo = sizeMemory.get(c.id)?.height;
-      if (memo) return memo;
-      const estimate = Math.sqrt(c.nodeIds.length) * NODE_HEIGHT * 1.2;
-      return Math.min(STAGE1_MAX_CONTAINER_HEIGHT, Math.max(NODE_HEIGHT, estimate));
-    };
+    // Collapsed boxes are compact cards; Stage 1 swaps in the measured
+    // Stage 2 size only while a box is expanded.
+    const nameById = new Map(
+      filteredGraphNodes.map((n) => [n.id, n.name ?? n.filePath?.split("/").pop() ?? n.id]),
+    );
 
     // Build container flow nodes (children NOT rendered yet — Task 12)
     const containerFlowNodes: ContainerFlowNode[] = containers.map((c, idx) => ({
       id: c.id,
       type: "container" as const,
       position: { x: 0, y: 0 },
-      width: containerWidth(c),
-      height: containerHeight(c),
+      width: COLLAPSED_CONTAINER_WIDTH,
+      height: COLLAPSED_CONTAINER_HEIGHT,
       data: {
         containerId: c.id,
         name: c.name,
         childCount: c.nodeIds.length,
+        previewNames: c.nodeIds
+          .slice(0, CONTAINER_PREVIEW_COUNT)
+          .map((id) => nameById.get(id) ?? id),
         strategy: c.strategy,
         colorIndex: idx % 12,
         isExpanded: false,
@@ -714,10 +707,11 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     // memo intentionally does NOT depend on `stage1Tick` (avoids rebuilding
     // the entire layer's structural state), so we override widths from
     // size memory here.
-    const sizeMemoryAtRun = useDashboardStore.getState().containerSizeMemory;
+    const { containerSizeMemory: sizeMemoryAtRun, expandedContainers: expandedAtRun } =
+      useDashboardStore.getState();
     const stage1Children: ElkChild[] = [
       ...containerFlowNodes.map((cn) => {
-        const memo = sizeMemoryAtRun.get(cn.id);
+        const memo = expandedAtRun.has(cn.id) ? sizeMemoryAtRun.get(cn.id) : undefined;
         return {
           id: cn.id,
           width: memo?.width ?? cn.width ?? NODE_WIDTH,
@@ -867,22 +861,11 @@ function useLayerDetailTopology(): LayerDetailTopology & {
           // Pad for container chrome (header + border)
           const actualSize = { width: maxX + 40, height: maxY + 60 };
 
-          // Recompute the Stage 1 estimate for this container using the
-          // SAME formula `built` used so we know what Stage 1 actually
-          // routed against. (Memo if present, else sqrt-clamped estimate.)
+          // The size Stage 1 routed against: the memo if one exists,
+          // otherwise the compact collapsed card.
           const memo = sizeMemoryBefore.get(containerId);
-          const STAGE1_MAX_W = 800;
-          const STAGE1_MAX_H = 600;
-          const stage1Width = memo?.width
-            ?? Math.min(
-              STAGE1_MAX_W,
-              Math.max(NODE_WIDTH, Math.sqrt(c.nodeIds.length) * NODE_WIDTH * 1.2),
-            );
-          const stage1Height = memo?.height
-            ?? Math.min(
-              STAGE1_MAX_H,
-              Math.max(NODE_HEIGHT, Math.sqrt(c.nodeIds.length) * NODE_HEIGHT * 1.2),
-            );
+          const stage1Width = memo?.width ?? COLLAPSED_CONTAINER_WIDTH;
+          const stage1Height = memo?.height ?? COLLAPSED_CONTAINER_HEIGHT;
           const dw = Math.abs(actualSize.width - stage1Width) / stage1Width;
           const dh = Math.abs(actualSize.height - stage1Height) / stage1Height;
           const deviated = dw > 0.2 || dh > 0.2;
