@@ -6,7 +6,7 @@ export interface ContainerNodeData extends Record<string, unknown> {
   containerId: string;
   name: string;
   childCount: number;
-  strategy: "folder" | "community";
+  strategy: "folder" | "prefix";
   colorIndex: number;
   isExpanded: boolean;
   hasSearchHits: boolean;

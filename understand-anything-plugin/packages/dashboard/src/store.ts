@@ -263,9 +263,9 @@ function navigateTourToLayer(
 
 /**
  * Container ids derive from per-layer state — folder names in folder-strategy
- * layers, community indices (`container:cluster-N`) in community-strategy
- * layers — and collide across layers (e.g. API Contracts and Load Testing
- * both produce `container:cluster-0`). When a tour step crosses layers we
+ * layers, filename prefixes (`container:prefix-agent`) in prefix-strategy
+ * layers — and collide across layers (e.g. two layers that both produce
+ * `container:prefix-index`). When a tour step crosses layers we
  * must drop the previous layer's container caches so Stage 2 actually re-
  * runs for the new layer's children. Mirrors the reset block in
  * `drillIntoLayer`.
