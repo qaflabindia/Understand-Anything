@@ -304,7 +304,7 @@ function useOverviewGraph() {
       target: agg.targetLayerId,
       label: `${agg.count}`,
       style: {
-        stroke: "rgba(212,165,116,0.4)",
+        stroke: "rgba(212,165,116,0.75)",
         strokeWidth: Math.min(1 + Math.log2(agg.count + 1), 5),
       },
       labelStyle: { fill: "#a39787", fontSize: 11, fontWeight: 600 },
@@ -581,9 +581,9 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     // container, so just fade everything in diff mode at this stage).
     const aggEdges: Edge[] = interContainerAggregated.map((agg, i) => {
       const baseStyle = diffMode
-        ? { stroke: "rgba(212,165,116,0.08)", strokeWidth: 1 }
+        ? { stroke: "rgba(212,165,116,0.2)", strokeWidth: 1 }
         : {
-            stroke: "rgba(212,165,116,0.4)",
+            stroke: "rgba(212,165,116,0.75)",
             strokeWidth: Math.min(1 + Math.log2(agg.count + 1), 5),
           };
       return {
@@ -633,7 +633,7 @@ function useLayerDetailTopology(): LayerDetailTopology & {
           id: `e-${portalEdgeIdx++}`,
           source: atomId,
           target: `portal:${portal.layerId}`,
-          style: { stroke: "rgba(212,165,116,0.2)", strokeWidth: 1, strokeDasharray: "4 4" },
+          style: { stroke: "rgba(212,165,116,0.6)", strokeWidth: 1.5, strokeDasharray: "4 4" },
           animated: false,
         });
       }
@@ -1232,7 +1232,7 @@ function useLayerDetailGraph() {
           source: realSrc,
           target: realTgt,
           label: m.type,
-          style: { stroke: "rgba(212,165,116,0.5)", strokeWidth: 1.5 },
+          style: { stroke: "rgba(212,165,116,0.8)", strokeWidth: 1.75 },
           labelStyle: { fill: "#a39787", fontSize: 10 },
         });
       }
@@ -1250,7 +1250,7 @@ function useLayerDetailGraph() {
         source: e.source,
         target: e.target,
         label: e.type,
-        style: { stroke: "rgba(212,165,116,0.5)", strokeWidth: 1.5 },
+        style: { stroke: "rgba(212,165,116,0.8)", strokeWidth: 1.75 },
         labelStyle: { fill: "#a39787", fontSize: 10 },
       });
     }
@@ -1276,10 +1276,10 @@ function useLayerDetailGraph() {
       if ((edge.style as Record<string, unknown>)?.strokeDasharray) return edge;
 
       if (isSelectedEdge) {
-        return { ...edge, animated: true, style: { stroke: "rgba(212,165,116,0.8)", strokeWidth: 2.5 }, labelStyle: { fill: "#d4a574", fontSize: 11, fontWeight: 600 } };
+        return { ...edge, animated: true, style: { stroke: "#e8b98a", strokeWidth: 3 }, labelStyle: { fill: "#d4a574", fontSize: 11, fontWeight: 600 } };
       }
       // Fade unrelated edges
-      return { ...edge, animated: false, style: { stroke: "rgba(212,165,116,0.08)", strokeWidth: 1 }, labelStyle: { fill: "rgba(163,151,135,0.2)", fontSize: 10 } };
+      return { ...edge, animated: false, style: { stroke: "rgba(212,165,116,0.18)", strokeWidth: 1 }, labelStyle: { fill: "rgba(163,151,135,0.35)", fontSize: 10 } };
     });
   }, [expandedEdges, topo.portalEdges, selectedNodeId]);
 
