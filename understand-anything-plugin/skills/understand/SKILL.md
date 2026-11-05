@@ -392,6 +392,8 @@ This script reads all `batch-*.json` files (including `batch-<i>-part-<k>.json` 
 
 The merge script also runs a `tested_by` linker that canonicalizes test-coverage edges in two passes. **Pass 1** walks LLM-emitted `tested_by` edges and flips inverted ones in place; semantically broken edges (test↔test, prod↔prod, orphan endpoints) are dropped. **Pass 2** supplements with path-convention pairings. Production nodes that end up sourcing any `tested_by` edge get a `"tested"` tag. All resulting edges run `production → test`.
 
+It then runs a deterministic HTTP call linker, so apps that talk over HTTP (a web client and its API, an MCP server calling a REST backend) are connected even though no import joins them. It reads Express route definitions and `app.use('/prefix', router)` mounts to build a route table, then matches client call sites (`api.get('/x')`, `fetch('/x')`, `request('POST', '/x')`, with axios `baseURL` prefixes applied) against it, treating `:param` and `${…}` segments as wildcards. Each caller gets one `calls` edge per matched route file, described `HTTP: <paths>`. When two servers serve the same path, the one nearest the caller in the folder tree wins. Test files are skipped.
+
 Output: `$UA_DIR/intermediate/assembled-graph.json`
 
 Include the script's warnings in `$PHASE_WARNINGS` for the reviewer.

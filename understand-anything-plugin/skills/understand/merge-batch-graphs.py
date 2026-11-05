@@ -1151,6 +1151,295 @@ def recover_imports_from_scan(
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
+# ── Deterministic HTTP call linker ────────────────────────────────────────
+#
+# Separate apps in one repo (a web UI, an MCP server, a backend API) talk over
+# HTTP, so no import edge connects them and the graph shows them as islands.
+# This pass reads JS/TS source, collects Express routes (with the prefixes
+# their routers are mounted under) and HTTP client calls, matches the paths,
+# and adds a `calls` edge from each calling file to the route file serving it.
+# When the same path is served by more than one app, the route file nearest
+# the caller in the folder tree wins (lixedin/ui → lixedin/server, not the
+# repo's other server).
+
+HTTP_SOURCE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+HTTP_METHODS = "get|post|put|patch|delete|all"
+HTTP_CLIENT_RECEIVERS = {"axios", "api", "client", "http", "https", "request", "superagent", "ky", "got"}
+
+_EXPRESS_RE = re.compile(r"""(?:from\s+['"]express['"]|require\(\s*['"]express['"]\s*\))""")
+_ROUTER_FACTORY_RE = re.compile(r"\b(?:express\s*\.\s*Router|Router|express)\s*\(")
+_ROUTE_DEF_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]*)\s*\.\s*(" + HTTP_METHODS + r")\s*\(\s*(['\"`])(/[^'\"`]*)\3"
+)
+_ROUTE_CHAIN_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\.\s*route\s*\(\s*(['\"`])(/[^'\"`]*)\2")
+_MOUNT_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]*)\s*\.\s*use\s*\(\s*(['\"`])(/[^'\"`]*)\2\s*,([^;]*?)\)\s*;?"
+)
+_IMPORT_DEFAULT_RE = re.compile(r"""import\s+([A-Za-z_$][\w$]*)\s*(?:,\s*\{[^}]*\})?\s+from\s+['"]([^'"]+)['"]""")
+_IMPORT_NAMED_RE = re.compile(r"""import\s*\{([^}]*)\}\s*from\s+['"]([^'"]+)['"]""")
+_REQUIRE_RE = re.compile(r"""(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)""")
+_CLIENT_METHOD_CALL_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]*)\s*\.\s*(get|post|put|patch|delete|request)\s*(?:<[^()]*?>)?\s*\(\s*(['\"`])((?:/|\$\{)[^'\"`]*)\3"
+)
+_CLIENT_FETCH_RE = re.compile(r"\bfetch\s*\(\s*(['\"`])((?:/|\$\{)[^'\"`]*)\1")
+_CLIENT_VERB_ARG_RE = re.compile(
+    r"\(\s*['\"](GET|POST|PUT|PATCH|DELETE)['\"]\s*,\s*(['\"`])((?:/|\$\{)[^'\"`]*)\2"
+)
+_AXIOS_BASE_RE = re.compile(r"baseURL\s*:\s*([^,\n}]+)")
+
+
+def _strip_template_head(raw: str) -> str | None:
+    """`${BASE}/api/x` → `/api/x`; a path that is all interpolation → None."""
+    path = raw
+    while path.startswith("${"):
+        end = path.find("}")
+        if end < 0:
+            return None
+        path = path[end + 1:]
+    return path if path.startswith("/") else None
+
+
+def _http_segments(path: str) -> list[str]:
+    path = path.split("?", 1)[0].split("#", 1)[0]
+    segments: list[str] = []
+    for seg in path.strip("/").split("/"):
+        if not seg:
+            continue
+        if seg.startswith(":") or "${" in seg or seg == "*":
+            segments.append("*")
+        else:
+            segments.append(seg.lower())
+    return segments
+
+
+def _join_http(prefix: str, path: str) -> str:
+    joined = "/".join(s for s in (prefix.strip("/"), path.strip("/")) if s)
+    return "/" + joined
+
+
+def _resolve_module(importer: str, spec: str, known: set[str]) -> str | None:
+    if not spec.startswith("."):
+        return None
+    base = os.path.normpath(os.path.join(os.path.dirname(importer), spec)).replace(os.sep, "/")
+    stem = re.sub(r"\.(?:m|c)?js$", "", base)
+    candidates = [base, stem] + [stem + ext for ext in HTTP_SOURCE_EXTENSIONS] + [
+        f"{stem}/index{ext}" for ext in HTTP_SOURCE_EXTENSIONS
+    ]
+    for cand in candidates:
+        if cand in known:
+            return cand
+    return None
+
+
+def _import_bindings(src: str, importer: str, known: set[str]) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for name, spec in _IMPORT_DEFAULT_RE.findall(src):
+        target = _resolve_module(importer, spec, known)
+        if target:
+            bindings[name] = target
+    for names, spec in _IMPORT_NAMED_RE.findall(src):
+        target = _resolve_module(importer, spec, known)
+        if not target:
+            continue
+        for part in names.split(","):
+            local = part.split(" as ")[-1].strip()
+            if local:
+                bindings[local] = target
+    for name, spec in _REQUIRE_RE.findall(src):
+        target = _resolve_module(importer, spec, known)
+        if target:
+            bindings[name] = target
+    return bindings
+
+
+def _axios_base_path(src: str) -> str | None:
+    """Path part of an `axios.create({ baseURL })`, following one const hop."""
+    if "axios.create" not in src:
+        return None
+    m = _AXIOS_BASE_RE.search(src)
+    if not m:
+        return None
+    expr = m.group(1).strip()
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", expr):
+        decl = re.search(r"(?:const|let|var)\s+" + re.escape(expr) + r"\s*=\s*([^;\n]+)", src)
+        if not decl:
+            return None
+        expr = decl.group(1).strip()
+    lit = re.fullmatch(r"(['\"`])(.*)\1", expr)
+    if not lit:
+        return None
+    body = lit.group(2)
+    tail = body[body.rfind("}") + 1:] if "${" in body else re.sub(r"^https?://[^/]+", "", body)
+    tail = tail.rstrip("/")
+    return tail if tail.startswith("/") else None
+
+
+def _folder_closeness(a: str, b: str) -> tuple[int, int]:
+    """Higher is closer: (shared leading folders, -folder hops between them)."""
+    da, db = a.split("/")[:-1], b.split("/")[:-1]
+    shared = 0
+    for x, y in zip(da, db):
+        if x != y:
+            break
+        shared += 1
+    return shared, -((len(da) - shared) + (len(db) - shared))
+
+
+def link_http_calls(
+    assembled: dict[str, Any],
+    project_root: Path,
+) -> tuple[int, list[str]]:
+    """Add `calls` edges from HTTP client files to the route files serving them.
+
+    Returns (edges_added, report_lines).
+    """
+    nodes = assembled.get("nodes", [])
+    file_ids: dict[str, str] = {}
+    for n in nodes:
+        path = n.get("filePath")
+        if n.get("type") == "file" and isinstance(path, str) and path.endswith(HTTP_SOURCE_EXTENSIONS):
+            file_ids[path] = n["id"]
+    if not file_ids:
+        return 0, []
+
+    sources: dict[str, str] = {}
+    for path in file_ids:
+        try:
+            sources[path] = (project_root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    known = set(sources)
+
+    server_files = {
+        p for p, src in sources.items()
+        if _EXPRESS_RE.search(src) or (_ROUTER_FACTORY_RE.search(src) and "Router" in src)
+    }
+
+    # Routes defined per server file, relative to that file's router.
+    local_routes: dict[str, list[str]] = {}
+    for path in server_files:
+        src = sources[path]
+        found = [
+            route for recv, _m, _q, route in _ROUTE_DEF_RE.findall(src)
+            if recv not in HTTP_CLIENT_RECEIVERS
+        ]
+        found += [route for recv, _q, route in _ROUTE_CHAIN_RE.findall(src) if recv not in HTTP_CLIENT_RECEIVERS]
+        if found:
+            local_routes[path] = found
+
+    # Mounts: file F mounts module M under prefix P via `x.use('/p', mod)`.
+    mounts: dict[str, list[tuple[str, str]]] = {}
+    for path in server_files:
+        src = sources[path]
+        bindings = _import_bindings(src, path, known)
+        for _recv, _q, prefix, args in _MOUNT_RE.findall(src):
+            for ident in re.findall(r"[A-Za-z_$][\w$]*", args):
+                target = bindings.get(ident)
+                if target:
+                    mounts.setdefault(target, []).append((path, prefix))
+
+    def prefixes_for(path: str, seen: frozenset[str] = frozenset()) -> set[str]:
+        parents = mounts.get(path)
+        if not parents or path in seen:
+            return {""}
+        out: set[str] = set()
+        for parent, prefix in parents:
+            for upper in prefixes_for(parent, seen | {path}):
+                out.add(_join_http(upper, prefix))
+        return out
+
+    route_table: list[tuple[list[str], str, str]] = []
+    for path, routes in local_routes.items():
+        for prefix in prefixes_for(path):
+            for route in routes:
+                full = _join_http(prefix, route)
+                route_table.append((_http_segments(full), path, full))
+    if not route_table:
+        return 0, []
+
+    # axios instances with a path in their baseURL (`${ORIGIN}/api`) prefix
+    # every call made through them, in their own file and in importers.
+    base_paths = {p: bp for p, src in sources.items() if (bp := _axios_base_path(src))}
+    imports_of: dict[str, set[str]] = {}
+    path_by_id = {fid: p for p, fid in file_ids.items()}
+    for edge in assembled.get("edges", []):
+        if edge.get("type") == "imports":
+            src_p, tgt_p = path_by_id.get(edge.get("source")), path_by_id.get(edge.get("target"))
+            if src_p and tgt_p:
+                imports_of.setdefault(src_p, set()).add(tgt_p)
+
+    def matches(call: list[str], route: list[str]) -> bool:
+        return len(call) == len(route) and all(
+            c == r or c == "*" or r == "*" for c, r in zip(call, route)
+        )
+
+    existing = {
+        (e.get("source"), e.get("target"), e.get("type")) for e in assembled.get("edges", [])
+    }
+    calls_by_pair: dict[tuple[str, str], list[str]] = {}
+    for path, src in sources.items():
+        if is_test_path(path):
+            continue
+        is_server = path in server_files
+        raw_calls: list[str] = []
+        for recv, _m, _q, raw in _CLIENT_METHOD_CALL_RE.findall(src):
+            if is_server and recv not in HTTP_CLIENT_RECEIVERS:
+                continue
+            raw_calls.append(raw)
+        raw_calls += [raw for _q, raw in _CLIENT_FETCH_RE.findall(src)]
+        raw_calls += [raw for _verb, _q, raw in _CLIENT_VERB_ARG_RE.findall(src)]
+        if not raw_calls:
+            continue
+        bases = {""}
+        for dep in {path} | imports_of.get(path, set()):
+            if dep in base_paths:
+                bases.add(base_paths[dep])
+        for raw in raw_calls:
+            call_path = _strip_template_head(raw)
+            if not call_path:
+                continue
+            best: list[tuple[str, str]] = []
+            best_rank: tuple[int, int] | None = None
+            for base in bases:
+                call = _http_segments(_join_http(base, call_path))
+                if not call:
+                    continue
+                for route, route_file, full in route_table:
+                    if route_file == path or not matches(call, route):
+                        continue
+                    rank = _folder_closeness(path, route_file)
+                    if best_rank is None or rank > best_rank:
+                        best, best_rank = [(route_file, full)], rank
+                    elif rank == best_rank:
+                        best.append((route_file, full))
+            for route_file, full in best:
+                calls_by_pair.setdefault((path, route_file), []).append(full)
+
+    added = 0
+    for (caller, route_file), paths in sorted(calls_by_pair.items()):
+        source_id, target_id = file_ids[caller], file_ids[route_file]
+        if (source_id, target_id, "calls") in existing:
+            continue
+        unique = sorted(set(paths))
+        shown = ", ".join(unique[:3]) + (f" (+{len(unique) - 3} more)" if len(unique) > 3 else "")
+        assembled.setdefault("edges", []).append({
+            "source": source_id,
+            "target": target_id,
+            "type": "calls",
+            "direction": "forward",
+            "weight": 0.8,
+            "description": f"HTTP: {shown}",
+        })
+        existing.add((source_id, target_id, "calls"))
+        added += 1
+
+    report = [
+        f"  {len(route_table):>4} × HTTP routes found in {len(local_routes)} route files",
+        f"  {added:>4} × calls edges added (HTTP client file → route file)",
+    ]
+    return added, report
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python merge-batch-graphs.py <project-root>", file=sys.stderr)
@@ -1331,6 +1620,12 @@ def main() -> None:
         report.append("")
         report.append("Imports edge recovery:")
         report.extend(recovery_report)
+
+    _http_added, http_report = link_http_calls(assembled, project_root)
+    if http_report:
+        report.append("")
+        report.append("HTTP call linking:")
+        report.extend(http_report)
 
     # Print report
     print("", file=sys.stderr)

@@ -1613,5 +1613,137 @@ class TestIncrementalEdgeCandidates(unittest.TestCase):
         }])
 
 
+
+class LinkHttpCallsTests(unittest.TestCase):
+    """Deterministic HTTP linker: client call sites → Express route files."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.root = Path(tempfile.mkdtemp(prefix="ua-http-"))
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _project(self, files: dict[str, str], imports: list[tuple[str, str]] = ()) -> dict[str, Any]:
+        for rel, body in files.items():
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        return {
+            "nodes": [_file_node(rel) for rel in files],
+            "edges": [
+                {"source": f"file:{a}", "target": f"file:{b}", "type": "imports",
+                 "direction": "forward", "weight": 0.7}
+                for a, b in imports
+            ],
+        }
+
+    def _calls(self, graph: dict[str, Any]) -> dict[tuple[str, str], str]:
+        return {
+            (e["source"][5:], e["target"][5:]): e.get("description", "")
+            for e in graph["edges"] if e["type"] == "calls"
+        }
+
+    def test_links_client_call_to_route_under_its_mount_prefix(self) -> None:
+        graph = self._project({
+            "api/src/app.ts": (
+                "import express from 'express';\n"
+                "import meRoutes from './routes/me.routes.js';\n"
+                "const app = express();\n"
+                "app.use('/api/me', meRoutes);\n"
+            ),
+            "api/src/routes/me.routes.ts": (
+                "import { Router } from 'express';\n"
+                "const router = Router();\n"
+                "router.put('/profile', ctrl.update);\n"
+                "router.get('/claims/:claimId', ctrl.claim);\n"
+            ),
+            "web/src/api.ts": (
+                "const api = axios.create({ baseURL: origin });\n"
+                "export const save = () => api.put('/api/me/profile', {});\n"
+                "export const claim = (id) => api.get(`/api/me/claims/${id}?full=1`);\n"
+            ),
+        })
+        added, _ = mbg.link_http_calls(graph, self.root)
+        self.assertEqual(added, 1)
+        self.assertEqual(
+            self._calls(graph),
+            {("web/src/api.ts", "api/src/routes/me.routes.ts"):
+             "HTTP: /api/me/claims/:claimId, /api/me/profile"},
+        )
+
+    def test_applies_axios_base_path_to_importing_files(self) -> None:
+        graph = self._project(
+            {
+                "server/src/app.ts": (
+                    "import express from 'express';\nimport tasks from './routes/tasks.routes.js';\n"
+                    "app.use('/api/tasks', tasks);\n"
+                ),
+                "server/src/routes/tasks.routes.ts": (
+                    "import express from 'express';\nconst router = express.Router();\n"
+                    "router.get('/:id', getTask);\n"
+                ),
+                "client/src/lib/api.ts": (
+                    "export const API_BASE_URL = `${ORIGIN}/api`;\n"
+                    "const api = axios.create({ baseURL: API_BASE_URL, headers: {} });\nexport default api;\n"
+                ),
+                "client/src/pages/Task.tsx": "const t = await api.get(`/tasks/${taskId}`);\n",
+            },
+            imports=[("client/src/pages/Task.tsx", "client/src/lib/api.ts")],
+        )
+        mbg.link_http_calls(graph, self.root)
+        self.assertIn(("client/src/pages/Task.tsx", "server/src/routes/tasks.routes.ts"), self._calls(graph))
+
+    def test_prefers_the_server_nearest_the_caller(self) -> None:
+        route = "import { Router } from 'express';\nrouter.post('/login', login);\n"
+        mount = "import express from 'express';\nimport auth from './routes/auth.routes.js';\napp.use('/api/auth', auth);\n"
+        graph = self._project({
+            "server/src/app.ts": mount,
+            "server/src/routes/auth.routes.ts": route,
+            "exchange/server/src/app.ts": mount,
+            "exchange/server/src/routes/auth.routes.ts": route,
+            "exchange/ui/src/api.ts": "api.post('/api/auth/login', body);\n",
+            "client/src/pages/Login.tsx": "fetch('/api/auth/login', { method: 'POST' });\n",
+        })
+        mbg.link_http_calls(graph, self.root)
+        self.assertEqual(
+            set(self._calls(graph)),
+            {
+                ("exchange/ui/src/api.ts", "exchange/server/src/routes/auth.routes.ts"),
+                ("client/src/pages/Login.tsx", "server/src/routes/auth.routes.ts"),
+            },
+        )
+
+    def test_reads_verb_first_wrappers_and_interpolated_base_urls(self) -> None:
+        graph = self._project({
+            "api/app.js": (
+                "const express = require('express');\nconst ingest = require('./ingest.routes');\n"
+                "app.use('/api/ingest/v1', ingest);\n"
+            ),
+            "api/ingest.routes.js": "const express = require('express');\nrouter.post('/human-profile', h);\n",
+            "mcp/client.ts": (
+                "const res = await fetch(`${BASE_URL}${path}`);\n"
+                "request('POST', '/api/ingest/v1/human-profile', pkg);\n"
+            ),
+        })
+        mbg.link_http_calls(graph, self.root)
+        self.assertEqual(set(self._calls(graph)), {("mcp/client.ts", "api/ingest.routes.js")})
+
+    def test_ignores_tests_unmatched_paths_and_existing_calls_edges(self) -> None:
+        graph = self._project({
+            "api/app.ts": "import express from 'express';\napp.get('/health', ok);\n",
+            "web/a.test.ts": "api.get('/health');\n",
+            "web/b.ts": "api.get('/health'); api.get('/nope');\n",
+            "web/c.ts": "api.get('/health');\n",
+        })
+        graph["edges"].append({"source": "file:web/c.ts", "target": "file:api/app.ts", "type": "calls",
+                               "direction": "forward", "weight": 0.8})
+        added, _ = mbg.link_http_calls(graph, self.root)
+        self.assertEqual(added, 1)
+        self.assertIn(("web/b.ts", "api/app.ts"), self._calls(graph))
+        self.assertNotIn(("web/a.test.ts", "api/app.ts"), self._calls(graph))
+
+
 if __name__ == "__main__":
     unittest.main()
