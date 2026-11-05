@@ -2,13 +2,12 @@ import type {
   GraphNode,
   GraphEdge,
 } from "@understand-anything/core/types";
-import { detectCommunities } from "./louvain";
 
 export interface DerivedContainer {
   id: string;
   name: string;
   nodeIds: string[];
-  strategy: "folder" | "community";
+  strategy: "folder" | "prefix";
 }
 
 export interface DeriveResult {
@@ -17,21 +16,21 @@ export interface DeriveResult {
 }
 
 const MIN_BUCKET_COUNT = 2;
-const MAX_CONCENTRATION = 0.7;
 const MIN_NODES_FOR_SUPPRESSION = 3;
+const MAX_CONTAINER_SIZE = 20;
+const MIN_PREFIX_SPLIT_SIZE = 3;
 const ROOT_BUCKET = "~";
 
 /**
- * Longest common prefix of the *directory* portion of paths, trimmed to a
- * `/` boundary. Using dirs (not full paths) avoids consuming the only
- * folder segment when all paths sit directly under the same folder
- * (e.g. `[auth/x, auth/y]` → LCP `""`, so we still group on `auth`).
+ * Longest common prefix of the *directory* portion of paths (each with its
+ * trailing `/`), trimmed to a `/` boundary, so files directly in the shared
+ * parent (`risk/grc.ts` next to `risk/handlers/a.ts`) land in the root bucket.
  */
 function commonPrefix(paths: string[]): string {
   if (paths.length === 0) return "";
   const dirs = paths.map((p) => {
     const slash = p.lastIndexOf("/");
-    return slash >= 0 ? p.slice(0, slash) : "";
+    return slash >= 0 ? p.slice(0, slash + 1) : "";
   });
   let prefix = dirs[0];
   for (const d of dirs) {
@@ -74,55 +73,45 @@ function groupByFolder(
   return { groups, rooted };
 }
 
-function shouldFallbackToCommunity(
-  groups: Map<string, string[]>,
-  rooted: string[],
-  totalNodes: number,
-): boolean {
-  const bucketCount = groups.size + (rooted.length > 0 ? 1 : 0);
-  if (bucketCount < MIN_BUCKET_COUNT) return true;
-  for (const ids of groups.values()) {
-    if (ids.length / totalNodes > MAX_CONCENTRATION) return true;
-  }
-  if (rooted.length / totalNodes > MAX_CONCENTRATION) return true;
-  return false;
+function filenameWords(path: string): string[] {
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const words = base.match(/[A-Z0-9]+(?![a-z])|[A-Z]?[a-z0-9]+/g);
+  return words ? words.map((w) => w.toLowerCase()) : [base.toLowerCase()];
 }
 
-export function deriveContainers(
+/** The first `depth` words of the filename, e.g. depth 2: grc-risk-scoring.ts → grc-risk. */
+function filePrefix(path: string, depth: number): string {
+  const words = filenameWords(path);
+  return words.slice(0, Math.min(depth, Math.max(1, words.length - 1))).join("-");
+}
+
+function groupByPrefix(
   nodes: GraphNode[],
-  edges: GraphEdge[],
-): DeriveResult {
-  if (nodes.length === 0) {
-    return { containers: [], ungrouped: [] };
+  ids: string[],
+  depth: number,
+): Map<string, string[]> {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const groups = new Map<string, string[]>();
+  for (const id of ids) {
+    const n = byId.get(id)!;
+    const key = n.filePath ? filePrefix(n.filePath, depth) : ROOT_BUCKET;
+    const arr = groups.get(key) ?? [];
+    arr.push(id);
+    groups.set(key, arr);
   }
+  return groups;
+}
 
+/**
+ * One level of grouping: folder boxes below the nodes' common prefix, or
+ * filename-prefix boxes when the nodes all sit in one flat folder.
+ */
+function bucket(nodes: GraphNode[], prefixDepth = 1): DerivedContainer[] {
   const { groups, rooted } = groupByFolder(nodes);
+  const bucketCount = groups.size + (rooted.length > 0 ? 1 : 0);
 
-  const useCommunity = shouldFallbackToCommunity(groups, rooted, nodes.length);
-  let containers: DerivedContainer[];
-
-  if (useCommunity) {
-    const communities = detectCommunities(
-      nodes.map((n) => n.id),
-      edges,
-    );
-    const byCommunity = new Map<number, string[]>();
-    for (const [nodeId, cid] of communities) {
-      const arr = byCommunity.get(cid) ?? [];
-      arr.push(nodeId);
-      byCommunity.set(cid, arr);
-    }
-    const sorted = [...byCommunity.entries()].sort((a, b) => a[0] - b[0]);
-    containers = sorted.map(([cid, ids], i) => ({
-      id: `container:cluster-${cid}`,
-      // A-Z for the first 26, then numeric. Avoids `String.fromCharCode(65+i)`
-      // wrapping into `[`, `\`, `]` ... once the cluster count exceeds 26.
-      name: i < 26 ? `Cluster ${String.fromCharCode(65 + i)}` : `Cluster ${i + 1}`,
-      nodeIds: ids,
-      strategy: "community" as const,
-    }));
-  } else {
-    containers = [...groups.entries()].map(([seg, ids]) => ({
+  if (bucketCount >= MIN_BUCKET_COUNT) {
+    const containers: DerivedContainer[] = [...groups.entries()].map(([seg, ids]) => ({
       id: `container:${seg}`,
       name: seg,
       nodeIds: ids,
@@ -136,7 +125,116 @@ export function deriveContainers(
         strategy: "folder" as const,
       });
     }
+    return containers;
   }
+
+  // Flat folder: no sub-folders to name boxes after, so group by the
+  // shared filename prefix (agent-*.ts, task-*.ts) instead.
+  const ids = rooted.length > 0 ? rooted : [...groups.values()][0];
+  const prefixes = groupByPrefix(nodes, ids, prefixDepth);
+  if (prefixes.size < MIN_BUCKET_COUNT) return [];
+  return [...prefixes.entries()].map(([prefix, members]) => ({
+    id: `container:prefix-${prefix}`,
+    name: prefix === ROOT_BUCKET ? ROOT_BUCKET : `${prefix}*`,
+    nodeIds: members,
+    strategy: "prefix" as const,
+  }));
+}
+
+function lastSegment(name: string): string {
+  return name.slice(name.lastIndexOf("/") + 1);
+}
+
+const OTHER_SUFFIX = " (other)";
+
+function childName(parent: DerivedContainer, child: DerivedContainer): string {
+  // A deeper prefix (grc-risk*) already spells out its parent (grc*).
+  if (parent.strategy === "prefix" && child.strategy === "prefix") return child.name;
+  const p = lastSegment(parent.name.replace(OTHER_SUFFIX, ""));
+  if (p === ROOT_BUCKET) return child.name;
+  // Files sitting directly in the parent folder are named after it.
+  if (child.name === ROOT_BUCKET) return p;
+  return `${p}/${child.name}`;
+}
+
+function otherName(name: string): string {
+  return name === ROOT_BUCKET || name.endsWith(OTHER_SUFFIX) ? name : `${name}${OTHER_SUFFIX}`;
+}
+
+/**
+ * Re-bucket a box that is too big to read at a glance, recursing until every
+ * box fits MAX_CONTAINER_SIZE or cannot be divided further. A prefix box is
+ * re-split on the next filename word (grc* → grc-risk*, grc-evidence*).
+ * Sub-groups too small to be worth a box are kept together in an "(other)"
+ * box instead of scattering into loose nodes or two-file boxes.
+ */
+function splitOversized(
+  container: DerivedContainer,
+  byId: Map<string, GraphNode>,
+  prefixDepth: number,
+): DerivedContainer[] {
+  if (container.nodeIds.length <= MAX_CONTAINER_SIZE) return [container];
+  const nextDepth = container.strategy === "prefix" ? prefixDepth + 1 : 1;
+  const children = bucket(
+    container.nodeIds.map((id) => byId.get(id)!),
+    nextDepth,
+  );
+  const minSize = (c: DerivedContainer) =>
+    c.strategy === "prefix" ? MIN_PREFIX_SPLIT_SIZE : MIN_BUCKET_COUNT;
+  const kept = children.filter((c) => c.nodeIds.length >= minSize(c));
+  if (kept.length === 0) return [container];
+
+  const leftovers = children
+    .filter((c) => c.nodeIds.length < minSize(c))
+    .flatMap((c) => c.nodeIds);
+  if (kept.some((c) => c.nodeIds.length === container.nodeIds.length)) {
+    return [container];
+  }
+
+  const result = kept.flatMap((child) =>
+    splitOversized(
+      {
+        id: `${container.id}/${child.id.slice("container:".length)}`,
+        name: childName(container, child),
+        nodeIds: child.nodeIds,
+        strategy: child.strategy,
+      },
+      byId,
+      nextDepth,
+    ),
+  );
+  if (leftovers.length > 0) {
+    result.push({ ...container, name: otherName(container.name), nodeIds: leftovers });
+  }
+  return result;
+}
+
+/**
+ * Splitting can name two boxes alike: a folder's own leftovers and the
+ * leftovers of its own-files box are both "components (other)".
+ */
+function mergeSameName(containers: DerivedContainer[]): DerivedContainer[] {
+  const byName = new Map<string, DerivedContainer>();
+  for (const c of containers) {
+    const existing = byName.get(c.name);
+    if (existing) existing.nodeIds = [...existing.nodeIds, ...c.nodeIds];
+    else byName.set(c.name, { ...c });
+  }
+  return [...byName.values()];
+}
+
+export function deriveContainers(
+  nodes: GraphNode[],
+  _edges: GraphEdge[],
+): DeriveResult {
+  if (nodes.length === 0) {
+    return { containers: [], ungrouped: [] };
+  }
+
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  let containers = mergeSameName(
+    bucket(nodes).flatMap((c) => splitOversized(c, byId, 1)),
+  );
 
   // Suppress single-child containers (their child becomes ungrouped).
   // Skip suppression for tiny layers — with so few nodes, even single-item
