@@ -2298,3 +2298,152 @@ describe('extract-import-map.mjs — deterministic stderr ordering across loader
     expect(tsLineIdx).toBeLessThan(composerLineIdx);
   });
 });
+
+describe('extract-import-map.mjs — workspace packages and Svelte source imports', () => {
+  let projectRoot;
+  afterEach(() => {
+    if (projectRoot) rmSync(projectRoot, { recursive: true, force: true });
+    projectRoot = null;
+  });
+  function inventory(tree, omitted = []) {
+    return Object.keys(tree).filter(path => !omitted.includes(path) && !path.split('/').includes('node_modules')).map(path => ({
+      path,
+      language: path.endsWith('.json') ? 'json' : path.endsWith('.svelte') ? 'svelte' : /\.[cm]?ts$/.test(path) ? 'typescript' : 'javascript',
+      fileCategory: path.endsWith('.json') ? 'config' : 'code',
+    }));
+  }
+
+  it('resolves scoped exports, wildcard subpaths, re-exports and literal dynamic imports from the complete inventory', () => {
+    const tree = {
+      'package.json': JSON.stringify({ name: 'consumer', workspaces: ['packages/*'] }),
+      'src/index.ts': `import '@demo/money'; export { rate } from '@demo/money/rate';\nexport * from '@demo/money/features/round';\nconst lazy = import('@demo/money/features/parse');\nimport 'external-dependency'; import '@demo/money/private';`,
+      'src/legacy.cjs': `const rate = require('@demo/money/rate');`,
+      'packages/money/package.json': JSON.stringify({ name: '@demo/money', exports: {
+        '.': { types: './types/index.d.ts', import: './src/index.ts' },
+        './rate': { import: './src/rate.ts', require: './src/rate.cjs' },
+        './features/*': './src/features/*.ts', './private': null,
+      } }),
+      'packages/money/src/index.ts': `throw new Error('source must not execute');`,
+      'packages/money/types/index.d.ts': 'export type Amount = string;',
+      'packages/money/src/rate.ts': 'export const rate = 1;',
+      'packages/money/src/rate.cjs': 'module.exports = 1;',
+      'packages/money/src/features/round.ts': 'export const round = 1;',
+      'packages/money/src/features/parse.ts': 'export const parse = 1;',
+      'packages/money/private.ts': 'export const hidden = 1;',
+      'node_modules/external-dependency/package.json': JSON.stringify({ name: 'external-dependency', main: 'index.js' }),
+      'node_modules/external-dependency/index.js': 'throw Error("external dependency must not execute");',
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: inventory(tree) });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['src/index.ts']).toEqual([
+      'packages/money/src/features/parse.ts', 'packages/money/src/features/round.ts',
+      'packages/money/src/index.ts', 'packages/money/src/rate.ts',
+    ]);
+    expect(result.output.importMap['src/legacy.cjs']).toEqual(['packages/money/src/rate.cjs']);
+    expect(result.output.failures).toEqual([]);
+  });
+
+  it('preserves selective analysis while resolving self packages, legacy main and explicit package subpaths', () => {
+    const tree = {
+      'package.json': JSON.stringify({ name: '@demo/root', exports: './src/root.ts' }),
+      'src/main.ts': `import '@demo/root'; import '@demo/legacy'; import '@demo/legacy/src/format';`,
+      'src/root.ts': 'export const root = true;',
+      'packages/legacy/package.json': JSON.stringify({ name: '@demo/legacy', main: './src/index.js' }),
+      'packages/legacy/src/index.ts': 'export const legacy = true;',
+      'packages/legacy/src/format.ts': 'export const format = true;',
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: inventory(tree), analysisPaths: ['src/main.ts'] });
+    expect(result.status, result.stderr).toBe(0);
+    expect(Object.keys(result.output.importMap)).toEqual(['src/main.ts']);
+    expect(result.output.stats.filesScanned).toBe(1);
+    expect(result.output.importMap['src/main.ts']).toEqual(['packages/legacy/src/format.ts', 'packages/legacy/src/index.ts', 'src/root.ts']);
+  });
+
+  it('does not probe omitted targets, escape package exports, bypass private subpaths or choose duplicate package names arbitrarily', () => {
+    const tree = {
+      'src/main.ts': `import '@demo/hidden'; import '@demo/escape'; import '@demo/private/secret'; import '@demo/duplicate';`,
+      'packages/hidden/package.json': JSON.stringify({ name: '@demo/hidden', exports: './src/index.ts' }),
+      'packages/hidden/src/index.ts': 'export const omitted = true;',
+      'packages/escape/package.json': JSON.stringify({ name: '@demo/escape', exports: '../outside.ts' }),
+      'packages/outside.ts': 'export const outside = true;',
+      'packages/private/package.json': JSON.stringify({ name: '@demo/private', exports: { '.': './index.ts' } }),
+      'packages/private/index.ts': 'export const index = true;',
+      'packages/private/secret.ts': 'export const secret = true;',
+      'projects/a/package.json': JSON.stringify({ name: '@demo/duplicate', exports: './index.ts' }),
+      'projects/a/index.ts': 'export const a = true;',
+      'projects/b/package.json': JSON.stringify({ name: '@demo/duplicate', exports: './index.ts' }),
+      'projects/b/index.ts': 'export const b = true;',
+      'projects/a/self.ts': `import '@demo/duplicate';`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: inventory(tree, ['packages/hidden/src/index.ts']) });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['src/main.ts']).toEqual([]);
+    expect(result.output.importMap['projects/a/self.ts']).toEqual(['projects/a/index.ts']);
+  });
+
+  it('parses only Svelte scripts and resolves closest Kit defaults, declared lib roots, component queries and module scripts', () => {
+    const tree = {
+      'apps/default/package.json': JSON.stringify({ devDependencies: { '@sveltejs/kit': '*' } }),
+      'apps/default/src/Page.svelte': `<script lang="ts">import Thing from '$lib/Thing.svelte?raw'; import data from './data.json?url';</script><Thing />`,
+      'apps/default/src/lib/Thing.svelte': '<p>Thing</p>',
+      'apps/default/src/data.json': '{}',
+      'apps/custom/package.json': JSON.stringify({ devDependencies: { '@sveltejs/kit': '*' } }),
+      'apps/custom/svelte.config.js': `throw new Error('do not execute config');\nconst config = { kit: { files: { lib: 'shared' } } }; export default config;`,
+      'apps/custom/src/Page.svelte': `<!-- <script>import './fake';</script> -->\n<div title="<script>import './fake';</script>">import './fake'</div>\n{'<script>import "./fake";</script>'}\n<script context="module" lang="ts">export * from '$lib/module';</script>\n<script>import Widget from '$lib/Widget.svelte?component'; const lazy = import('$lib/lazy');\n// require('./fake');\n/* import './fake'; */\nconst prose = "require('./fake')"; const marker = '<!-- -->'; const pattern = /import('fake')/;</script>`,
+      'apps/custom/shared/Widget.svelte': '<p>Widget</p>',
+      'apps/custom/shared/module.ts': 'export const module = true;',
+      'apps/custom/shared/lazy.js': 'export const lazy = true;',
+      'apps/custom/src/lib/Widget.svelte': '<p>wrong default</p>',
+      'apps/custom/src/fake.js': 'throw Error("fake import");',
+    };
+    projectRoot = setupTree(tree);
+    const files = inventory(tree);
+    files.find(file => file.path === 'apps/default/src/Page.svelte').fileCategory = 'markup';
+    const result = runScript(projectRoot, { projectRoot, files });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['apps/default/src/Page.svelte']).toEqual(['apps/default/src/data.json', 'apps/default/src/lib/Thing.svelte']);
+    expect(result.output.importMap['apps/custom/src/Page.svelte']).toEqual(['apps/custom/shared/Widget.svelte', 'apps/custom/shared/lazy.js', 'apps/custom/shared/module.ts']);
+    expect(result.output.failures).toEqual([]);
+  });
+
+  it('honors explicit nearest tsconfig $lib paths and does not guess dynamic Svelte configuration', () => {
+    const tree = {
+      'svelte.config.js': 'export default { kit: {} };',
+      'src/lib/value.ts': 'export const outer = true;',
+      'apps/typed/svelte.config.ts': `export default { kit: { files: { lib: 'shared' } } };`,
+      'apps/typed/tsconfig.json': JSON.stringify({ compilerOptions: { paths: { '$lib/*': ['./overrides/*'] } } }),
+      'apps/typed/src/main.ts': `import '$lib/value';`,
+      'apps/typed/overrides/value.ts': 'export const override = true;',
+      'apps/typed/shared/value.ts': 'export const wrong = true;',
+      'apps/dynamic/svelte.config.js': `export default { kit: { files: { lib: chooseDirectory() } } };`,
+      'apps/dynamic/src/Page.svelte': `<script>import '$lib/value';</script>`,
+      'apps/dynamic/src/lib/value.ts': 'export const guessed = true;',
+      'apps/plain/svelte.config.js': 'export default { compilerOptions: {} };',
+      'apps/plain/src/Page.svelte': `<script>import '$lib/value';</script>`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: inventory(tree) });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['apps/typed/src/main.ts']).toEqual(['apps/typed/overrides/value.ts']);
+    expect(result.output.importMap['apps/dynamic/src/Page.svelte']).toEqual([]);
+    expect(result.output.importMap['apps/plain/src/Page.svelte']).toEqual([]);
+  });
+
+  it('supplements literal imports without inventing imports from comments, strings, regexes, templates or computed expressions', () => {
+    const tree = {
+      'src/main.mts': `export { value } from './real.js'; export * from './star.js';\nconst lazy = import('./lazy.js', { with: { type: 'json' } }); const cjs = require('./cjs.cjs');\nconst text = "require('./fake')"; const template = \`import('./fake')\`; const pattern = /require('fake')/;\n// export * from './fake';\n/* import('./fake') */\nconst computed = import('./fake' + suffix); obj.require('./fake');`,
+      'src/real.ts': 'export const value = 1;',
+      'src/star.ts': 'export const star = 1;',
+      'src/lazy.ts': 'export const lazy = 1;',
+      'src/cjs.cts': 'export const cjs = 1;',
+      'src/fake.ts': 'throw Error("phantom dependency");',
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: inventory(tree) });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output.importMap['src/main.mts']).toEqual(['src/cjs.cts', 'src/lazy.ts', 'src/real.ts', 'src/star.ts']);
+  });
+});

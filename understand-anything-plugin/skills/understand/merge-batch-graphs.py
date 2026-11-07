@@ -1440,12 +1440,56 @@ def link_http_calls(
     return added, report
 
 
+def link_graph_relationships(
+    graph: dict[str, Any], project_root: Path, scan_path: Path,
+) -> list[str]:
+    """Recompute deterministic links for both batch merges and review refreshes."""
+    from framework_links import link_framework_relationships
+    from source_links import link_source_references
+
+    # These links can depend on a third file such as a framework config. Even
+    # if neither endpoint changed, their old evidence may no longer apply.
+    linkers = (
+        ("framework-links", link_framework_relationships),
+        ("source-references", link_source_references),
+    )
+    derived = {name for name, _ in linkers}
+    graph["edges"] = [edge for edge in graph["edges"] if edge.get("derivedBy") not in derived]
+    report = []
+    for title, linker in (("Imports edge recovery", lambda: recover_imports_from_scan(graph, scan_path)),
+                          ("HTTP call linking", lambda: link_http_calls(graph, project_root))):
+        _, lines = linker()
+        if lines:
+            report.extend(["", f"{title}:", *lines])
+    for name, linker in linkers:
+        start = len(graph["edges"])
+        _, lines = linker(graph, project_root)
+        for edge in graph["edges"][start:]:
+            edge["derivedBy"] = name
+        if lines:
+            report.extend(["", f"{name}:", *lines])
+    return report
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python merge-batch-graphs.py <project-root>", file=sys.stderr)
         sys.exit(1)
 
     project_root = Path(sys.argv[1]).resolve()
+    if len(sys.argv) > 2 and sys.argv[2] == "--refresh-relationships":
+        if len(sys.argv) != 6:
+            raise SystemExit("Expected input graph, scan result and candidate output paths")
+        input_graph, scan_path, output_path = (Path(arg).resolve() for arg in sys.argv[3:])
+        if len({input_graph, scan_path, output_path}) != 3:
+            raise SystemExit("Input and output paths must be distinct")
+        graph = json.loads(input_graph.read_text(encoding="utf-8"))
+        # Generated imports have a deterministic replacement in the fresh map.
+        graph["edges"] = [edge for edge in graph["edges"] if not edge.get("recoveredFromImportMap")]
+        for line in link_graph_relationships(graph, project_root, scan_path):
+            print(line, file=sys.stderr)
+        output_path.write_text(json.dumps(graph, indent=2, ensure_ascii=False), encoding="utf-8")
+        return
     intermediate_dir = resolve_ua_dir(project_root) / "intermediate"
     plan_path = intermediate_dir / "incremental-plan.json"
     plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.exists() else {}
@@ -1611,21 +1655,7 @@ def main() -> None:
             f"files was excluded from the final graph)"
         )
 
-    # Recover any imports edges file-analyzer batches dropped despite
-    # `batchImportData` containing them. The project-scanner's importMap
-    # is the deterministic source of truth.
-    scan_result_path = intermediate_dir / "scan-result.json"
-    recovered, recovery_report = recover_imports_from_scan(assembled, scan_result_path)
-    if recovery_report:
-        report.append("")
-        report.append("Imports edge recovery:")
-        report.extend(recovery_report)
-
-    _http_added, http_report = link_http_calls(assembled, project_root)
-    if http_report:
-        report.append("")
-        report.append("HTTP call linking:")
-        report.extend(http_report)
+    report.extend(link_graph_relationships(assembled, project_root, intermediate_dir / "scan-result.json"))
 
     # Print report
     print("", file=sys.stderr)

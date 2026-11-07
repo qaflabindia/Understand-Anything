@@ -922,6 +922,83 @@ describe('prepare-incremental.mjs', { timeout: 30_000 }, () => {
     expect(scan.importMap['src/index.ts']).toEqual(['alternate/foo.ts']);
   });
 
+  it.each([
+    {
+      configPath: 'packages/shared/package.json',
+      configBefore: JSON.stringify({ name: '@demo/shared', exports: './first.ts' }),
+      configAfter: JSON.stringify({ name: '@demo/shared', exports: './second.ts' }),
+      importer: 'src/index.ts',
+      importSource: "import '@demo/shared';\n",
+      targetBefore: 'packages/shared/first.ts',
+      targetAfter: 'packages/shared/second.ts',
+      action: 'PARTIAL_UPDATE',
+    },
+    {
+      configPath: 'app/svelte.config.js',
+      configBefore: "export default { kit: {} };\n",
+      configAfter: "export default { kit: { files: { lib: 'second' } } };\n",
+      importer: 'app/src/Page.svelte',
+      importSource: "<script>import '$lib/widget';</script>\n",
+      targetBefore: 'app/src/lib/widget.ts',
+      targetAfter: 'app/second/widget.ts',
+      action: 'SKIP',
+    },
+  ])('replaces unchanged importers’ edges when $configPath retargets an alias', ({
+    configPath, configBefore, configAfter, importer, importSource, targetBefore, targetAfter, action,
+  }) => {
+    const { root, baseCommit } = setupRepository({
+      [configPath]: configBefore,
+      [importer]: importSource,
+      [targetBefore]: 'export const value = 1;\n',
+      [targetAfter]: 'export const value = 2;\n',
+      ...(action === 'SKIP' ? {
+        'app/src/routes/+layout.svelte': '<slot />',
+        'app/src/routes/+page.svelte': '<p>Page</p>',
+      } : {}),
+    });
+    const graphPath = join(root, '.ua', 'knowledge-graph.json');
+    const baseline = JSON.parse(readFileSync(graphPath, 'utf-8'));
+    const layoutLink = edge => edge.source === 'file:app/src/routes/+layout.svelte'
+      && edge.target === 'file:app/src/routes/+page.svelte' && edge.derivedBy === 'framework-links';
+    if (action === 'SKIP') {
+      const intermediate = join(root, '.ua', 'intermediate');
+      writeFileSync(join(intermediate, 'batch-0.json'), JSON.stringify({ nodes: baseline.nodes, edges: baseline.edges }));
+      run(python, [mergeScript, root], root);
+      baseline.edges = JSON.parse(readFileSync(join(intermediate, 'assembled-graph.json'), 'utf-8')).edges;
+      expect(baseline.edges.some(layoutLink)).toBe(true);
+      writeFileSync(graphPath, JSON.stringify(baseline));
+    }
+    const importerTargets = graph => graph.edges
+      .filter(edge => edge.source === `file:${importer}` && edge.type === 'imports')
+      .map(edge => edge.target);
+    expect(importerTargets(baseline)).toEqual([`file:${targetBefore}`]);
+
+    writeProjectFile(root, configPath, configAfter);
+    commit(root, 'retarget import resolver config');
+
+    const { plan, scan } = prepare(root, baseCommit);
+    expect(plan.action).toBe(action);
+    expect(plan.importMapRefreshPaths).toContain(importer);
+    expect(plan.filesToReanalyze).not.toContain(importer);
+    expect(scan.importMap[importer]).toEqual([targetAfter]);
+
+    if (action === 'PARTIAL_UPDATE') {
+      const intermediate = join(root, '.ua', 'intermediate');
+      const retained = JSON.parse(readFileSync(join(intermediate, 'batch-existing.json'), 'utf-8'));
+      expect(importerTargets(retained)).toEqual([]);
+      writeFileSync(join(intermediate, 'batch-0.json'), JSON.stringify({
+        nodes: [baseline.nodes.find(node => node.filePath === configPath)],
+        edges: [],
+      }));
+      run(python, [mergeScript, root], root);
+    }
+    run(process.execPath, [finalizeScript, root], root);
+    const graph = JSON.parse(readFileSync(graphPath, 'utf-8'));
+    expect(graph.nodes.some(node => node.filePath === targetBefore)).toBe(true);
+    expect(importerTargets(graph)).toEqual([`file:${targetAfter}`]);
+    if (action === 'SKIP') expect(graph.edges.some(layoutLink)).toBe(false);
+  });
+
   it('aborts without advancing baselines when import extraction reports a config failure', () => {
     const { root, baseCommit } = setupRepository({
       'tsconfig.json': JSON.stringify({

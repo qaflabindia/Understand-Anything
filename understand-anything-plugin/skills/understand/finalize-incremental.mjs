@@ -8,20 +8,24 @@
  * either the previous or regenerated layers/tour, performs deterministic
  * dangling-reference cleanup and local layer placement, then atomically saves
  * knowledge-graph.json. Only after that succeeds does it patch fingerprints
- * and advance meta.json. SKIP applies the fingerprint/meta patch only; a
+ * and advance meta.json. SKIP refreshes deterministic relationships and applies the fingerprint/meta patch; a
  * generated-artifact-only SKIP deliberately advances nothing.
  */
 
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   existsSync,
+  mkdtempSync,
+  rmSync,
   readFileSync,
   realpathSync,
   renameSync,
   writeFileSync,
 } from 'node:fs';
+import { runRelationshipMerge } from './refresh-relationships.mjs';
 import { validateIncrementalSymbols, formatSymbolReport } from './validate-incremental-symbols.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -410,11 +414,23 @@ async function main() {
     if (!previousGraph || !Array.isArray(previousGraph.nodes) || !Array.isArray(previousGraph.edges)) {
       throw new Error('knowledge-graph.json is missing or invalid; baseline not advanced');
     }
-    const refreshedGraph = refreshGraphImports(
+    let refreshedGraph = refreshGraphImports(
       previousGraph,
       scan.importMap ?? {},
       importMapRefreshPaths,
     );
+    // An alias/config or literal reference can change while symbols remain
+    // identical. Rebuild its derived edges before advancing the baseline.
+    if (importMapRefreshPaths.length && scan.importMap) {
+      const scratch = mkdtempSync(join(tmpdir(), 'ua-skip-relink-'));
+      try {
+        const input = join(scratch, 'input.json');
+        const output = join(scratch, 'output.json');
+        writeFileSync(input, JSON.stringify(refreshedGraph));
+        runRelationshipMerge(projectRoot, input, join(intermediateDir, 'scan-result.json'), output);
+        refreshedGraph = readJson(output);
+      } finally { rmSync(scratch, { recursive: true, force: true }); }
+    }
     atomicWriteJson(graphPath, {
       ...refreshedGraph,
       project: projectMetadata(previousGraph.project, plan, scan),

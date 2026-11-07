@@ -1,5 +1,6 @@
 import { execFile, execFileSync } from "child_process";
 import type { KnowledgeGraph, GraphNode, GraphEdge } from "./types.js";
+import { createIgnoreFilter, type IgnoreFilter } from "./ignore-filter.js";
 
 export interface StalenessResult {
   stale: boolean;
@@ -65,6 +66,7 @@ interface ProjectGitSnapshot {
   repoRoot: string;
   headCommitHash: string;
   dirtyFiles: string[];
+  analysisIgnore: IgnoreFilter;
 }
 
 const GIT_TIMEOUT_MS = 5_000;
@@ -181,15 +183,20 @@ async function createProjectGitSnapshot(
     ]),
   ]);
 
+  // Match analysis scope rather than treating excluded IDE state, build output
+  // or dependencies as unmapped source changes. Keep the filter in the shared
+  // snapshot so knowledge and domain freshness use the same rules.
+  const analysisIgnore = createIgnoreFilter(projectDir);
   return {
     projectDir,
     repoRoot,
     headCommitHash,
+    analysisIgnore,
     dirtyFiles: uniqueSortedPaths(
       parseNulDelimitedPaths(staged),
       parseNulDelimitedPaths(unstaged),
       parseNulDelimitedPaths(untracked),
-    ),
+    ).filter((file) => !analysisIgnore.isIgnored(file)),
   };
 }
 
@@ -259,6 +266,10 @@ async function evaluateGraphFreshness(
       ...optionalAnalysisTime(input),
     };
   }
+
+  committedFiles = committedFiles.filter(
+    (file) => !snapshot.analysisIgnore.isIgnored(file),
+  );
 
   if (committedFiles.length === 0) {
     if (snapshot.dirtyFiles.length > 0) {

@@ -112,9 +112,14 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
    DASHBOARD_DIR="$PLUGIN_ROOT/packages/dashboard"
    ```
 
-4. **Fast path — try the prebuilt viewer first (no install, no build).** Each release ships a self-contained viewer tarball; run it pinned to the installed plugin version:
+4. **Use the installed source when it is a tracked checkout.** This includes local forks and committed custom changes, even when their package version matches an upstream release. A prebuilt upstream viewer must not silently bypass that source. Detect the runtime kind with the bundled helper:
    ```bash
    : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
+   DASHBOARD_RUNTIME=$(node "$PLUGIN_ROOT/skills/understand-dashboard/runtime-kind.mjs" "$PLUGIN_ROOT")
+   ```
+   - If `DASHBOARD_RUNTIME` is `checkout`, skip the prebuilt viewer and continue with steps 5–6.
+   - Otherwise, try the version-pinned prebuilt viewer (no install or build):
+   ```bash
    : "${PROJECT_DIR:?Run step 1 first so PROJECT_DIR is set}"
    PLUGIN_VERSION=$(node -p "require('$PLUGIN_ROOT/package.json').version")
    VIEWER_URL="https://github.com/Egonex-AI/Understand-Anything/releases/download/v${PLUGIN_VERSION}/understand-anything-viewer.tgz"
@@ -124,11 +129,13 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
    - If the line appears, **skip steps 5-6** and continue at step 7.
    - If the process exits without printing it (no release asset for this version, or no network), fall back to steps 5-6.
 
-5. Fallback: install dependencies and build if needed:
+5. Local checkout or fallback: install missing dependencies and build the local core:
    ```bash
    : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
    DASHBOARD_DIR="${DASHBOARD_DIR:-$PLUGIN_ROOT/packages/dashboard}"
-   cd "$DASHBOARD_DIR" && (pnpm install --frozen-lockfile 2>/dev/null || pnpm install)
+   if [ ! -x "$DASHBOARD_DIR/node_modules/.bin/vite" ]; then
+     (cd "$DASHBOARD_DIR" && pnpm install --frozen-lockfile)
+   fi
    ```
    Then ensure the core package is built (the dashboard depends on it):
    ```bash
@@ -136,7 +143,7 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
    cd "$PLUGIN_ROOT" && pnpm --filter @understand-anything/core build
    ```
 
-6. Fallback: start the Vite dev server pointing at the project's knowledge graph:
+6. Start the local Vite dev server pointing at the project's knowledge graph:
    ```bash
    : "${PROJECT_DIR:?Run step 1 first so PROJECT_DIR is set}"
    : "${DASHBOARD_DIR:?Run step 5 first so DASHBOARD_DIR is set}"
@@ -161,7 +168,7 @@ Start the Understand Anything dashboard to visualize the knowledge graph for the
 
 ## Notes
 
-- The fast path (step 4) downloads a version-pinned, self-contained viewer from the GitHub release — nothing is installed into the plugin directory and no build runs
+- Tracked source checkouts always run their own local dashboard. For installed bundles, the fast path (step 4) downloads a version-pinned, self-contained viewer from the GitHub release — nothing is installed into the plugin directory and no build runs
 - The dashboard auto-opens in the default browser (both the viewer and Vite's `--open`)
 - If port 5173 is already in use, the next available port is picked (both paths)
 - In the fallback, the `GRAPH_DIR` environment variable tells the dev server where to find the knowledge graph

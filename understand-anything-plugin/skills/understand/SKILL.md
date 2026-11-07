@@ -190,7 +190,13 @@ Determine whether to run a full analysis or incremental update.
    | Existing graph + unchanged commit hash | Ask the user: "The graph is up to date at this commit. Would you like to: **(a)** run a full rebuild (`--full`), **(b)** run the LLM graph reviewer (`--review`), or **(c)** do nothing?" Then follow their choice. If they pick (c), STOP. |
    | Existing graph + changed files | Run deterministic incremental preparation below |
 
-   **Review-only path:** Copy the existing `knowledge-graph.json` to `$UA_DIR/intermediate/assembled-graph.json`, then jump directly to Phase 6 step 3.
+   **Review-only path:** Recompute deterministic relationships from the current source inventory before reviewing the existing graph. The helper writes a candidate and refreshed scan inventory; it does not publish the graph or advance metadata:
+   ```bash
+   node "<SKILL_DIR>/refresh-relationships.mjs" "$PROJECT_ROOT" \
+     "$UA_DIR/knowledge-graph.json" "$UA_DIR/intermediate/assembled-graph.json" \
+     --scan-output "$UA_DIR/intermediate/scan-result.json"
+   ```
+   If the helper reports source or inventory drift, use the structural update path. Otherwise, jump to Phase 6 step 3 with the candidate. Reuse the same helper when the user requests a relationship refresh at an unchanged commit.
 
    For incremental updates, do **not** construct the changed-file list by hand. Run the bundled reconciliation helper with the previous analyzed commit. Pass `--exclude "$EXCLUDE_PATTERNS"` only when the option is non-empty:
    ```bash

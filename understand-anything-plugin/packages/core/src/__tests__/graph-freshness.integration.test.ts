@@ -99,6 +99,52 @@ describe(
     });
   });
 
+  it.each([".ua", ".understand-anything"])(
+    "uses analysis ignore rules for tracked workspace state and new files in %s",
+    async (dataDir) => {
+      const statePath = "mobile/App.xcodeproj/xcuserdata/person.xcuserdatad/UserInterfaceState.xcuserstate";
+      const { repoDir, baseline } = createRepository({
+        "src/index.ts": "export const value = 1;\n",
+        [statePath]: "original UI state",
+        [`${dataDir}/.understandignore`]: "xcuserdata/\nignored-generated/\n",
+      });
+      writeProjectFile(repoDir, statePath, "changed UI state");
+      writeProjectFile(repoDir, "ignored-generated/output.ts", "generated");
+      await expect(getGraphFreshness(repoDir, { graphCommitHash: baseline }))
+        .resolves.toMatchObject({ status: "fresh", changedFiles: [] });
+
+      writeProjectFile(repoDir, "src/new-feature.ts", "export const feature = true;\n");
+      await expect(getGraphFreshness(repoDir, { graphCommitHash: baseline }))
+        .resolves.toMatchObject({
+          status: "dirty",
+          changedFiles: ["src/new-feature.ts"],
+          changedFileCount: 1,
+        });
+    },
+  );
+
+  it("ignores excluded committed changes while preserving explicit include overrides", async () => {
+    const { repoDir, baseline } = createRepository({
+      "src/index.ts": "export const value = 1;\n",
+      "generated/cache.ts": "original",
+      "generated/keep.ts": "original",
+      ".ua/.understandignore": "generated/*\n!generated/keep.ts\n",
+    });
+    writeProjectFile(repoDir, "generated/cache.ts", "changed excluded output");
+    commitAll(repoDir, "excluded generated output");
+    await expect(getGraphFreshness(repoDir, { graphCommitHash: baseline }))
+      .resolves.toMatchObject({ status: "fresh", changedFiles: [] });
+
+    writeProjectFile(repoDir, "generated/keep.ts", "changed explicitly included source");
+    commitAll(repoDir, "included source");
+    await expect(getGraphFreshness(repoDir, { graphCommitHash: baseline }))
+      .resolves.toMatchObject({
+        status: "stale",
+        changedFiles: ["generated/keep.ts"],
+        changedFileCount: 1,
+      });
+  });
+
   it.each([
     {
       name: "unstaged",

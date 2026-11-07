@@ -98,7 +98,9 @@ function isImportResolverConfig(path) {
   return name === 'tsconfig.json'
     || name === 'go.mod'
     || name === 'composer.json'
-    || name === 'Package.swift';
+    || name === 'Package.swift'
+    || name === 'package.json'
+    || /^svelte\.config\.(?:[cm]?js|ts)$/.test(name);
 }
 
 function readJson(path, fallback = null) {

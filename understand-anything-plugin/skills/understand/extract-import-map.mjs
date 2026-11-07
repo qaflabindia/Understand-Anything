@@ -589,6 +589,246 @@ function findNearestConfigDir(startDir, configMap) {
  *
  * Build once; pass everywhere.
  */
+// Read JavaScript syntax without evaluating configuration or module code. Literal
+// tokens let supplemental imports ignore comments, prose strings and regexes.
+function jsTokens(content) {
+  const tokens = [];
+  const regexAfter = new Set(['=', '(', '[', '{', ':', ',', ';', '!', '?', '=>', 'return', 'case', 'throw', '&&', '||']);
+  for (let i = 0; i < content.length;) {
+    const ch = content[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (content.startsWith('//', i)) { while (i < content.length && content[i] !== '\n') i++; continue; }
+    if (content.startsWith('/*', i)) { const end = content.indexOf('*/', i + 2); i = end < 0 ? content.length : end + 2; continue; }
+    if (ch === '`') {
+      i++;
+      while (i < content.length) {
+        if (content[i] === '\\') i += 2;
+        else if (content[i++] === '`') break;
+      }
+      tokens.push({ value: '<template>', type: 'opaque' });
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const quote = ch; let value = ''; let closed = false; i++;
+      while (i < content.length) {
+        const c = content[i++];
+        if (c === quote) { closed = true; break; }
+        if (c === '\\') {
+          const escaped = content[i++];
+          if (escaped === '\n') continue;
+          const widths = { x: 2, u: 4 };
+          const width = widths[escaped];
+          if (width && new RegExp(`^[0-9a-fA-F]{${width}}$`).test(content.slice(i, i + width))) {
+            value += String.fromCharCode(parseInt(content.slice(i, i + width), 16)); i += width;
+          } else value += ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v', '0': '\0' })[escaped] ?? escaped ?? '';
+        } else value += c;
+      }
+      tokens.push({ value, type: closed ? 'string' : 'opaque' });
+      continue;
+    }
+    if (ch === '/' && (!tokens.length || regexAfter.has(tokens.at(-1).value))) {
+      i++; let inClass = false;
+      while (i < content.length) {
+        const c = content[i++];
+        if (c === '\\') i++;
+        else if (c === '[') inClass = true;
+        else if (c === ']') inClass = false;
+        else if (c === '/' && !inClass) { while (/[a-z]/i.test(content[i] ?? '')) i++; break; }
+        else if (c === '\n') break;
+      }
+      tokens.push({ value: '<regex>', type: 'opaque' });
+      continue;
+    }
+    const word = /^[\w$]+/.exec(content.slice(i));
+    if (word) { tokens.push({ value: word[0], type: 'word' }); i += word[0].length; continue; }
+    const pair = content.slice(i, i + 2);
+    if (['=>', '&&', '||', '?.'].includes(pair)) { tokens.push({ value: pair }); i += 2; }
+    else { tokens.push({ value: ch }); i++; }
+  }
+  return tokens;
+}
+
+function extractJsModuleSources(content) {
+  const tokens = jsTokens(content); const sources = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type !== 'word' || ['.', '?.'].includes(tokens[i - 1]?.value)) continue;
+    if (['require', 'import'].includes(token.value) && tokens[i + 1]?.value === '(' && tokens[i + 2]?.type === 'string') {
+      const end = tokens[i + 3]?.value;
+      if (end === ')' || (token.value === 'import' && end === ',')) sources.push({ source: tokens[i + 2].value, kind: token.value });
+    }
+    if (token.value === 'export' && ['*', '{', 'type'].includes(tokens[i + 1]?.value)) {
+      for (let j = i + 2; j < tokens.length; j++) {
+        if ([';', 'export', 'import'].includes(tokens[j].value)) break;
+        if (tokens[j].value === 'from' && tokens[j + 1]?.type === 'string') { sources.push({ source: tokens[j + 1].value, kind: 'import' }); break; }
+      }
+    }
+  }
+  return sources;
+}
+
+function svelteScripts(content) {
+  const blocks = [];
+  for (let i = 0; i < content.length;) {
+    if (content.startsWith('<!--', i)) {
+      const end = content.indexOf('-->', i + 4); i = end < 0 ? content.length : end + 3; continue;
+    }
+    // Svelte markup expressions and quoted tag attributes can contain script
+    // examples. Only real markup tags open a script block.
+    if (content[i] === '{') {
+      let depth = 1; let quote = ''; i++;
+      while (i < content.length && depth) {
+        const ch = content[i++];
+        if (quote) { if (ch === '\\') i++; else if (ch === quote) quote = ''; }
+        else if (['"', "'", '`'].includes(ch)) quote = ch;
+        else if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+      }
+      continue;
+    }
+    if (content[i] !== '<') { i++; continue; }
+    const start = i; let quote = ''; i++;
+    while (i < content.length) {
+      const ch = content[i++];
+      if (quote) { if (ch === quote) quote = ''; }
+      else if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === '>') break;
+    }
+    const tag = content.slice(start, i);
+    if (!/^<script(?:\s|>)/i.test(tag)) continue;
+    const close = /<\/script\s*>/gi; close.lastIndex = i;
+    const match = close.exec(content);
+    if (!match) break;
+    const lang = /\blang\s*=\s*(?:["']([^"']+)["']|([^\s>]+))/i.exec(tag);
+    const language = (lang?.[1] ?? lang?.[2] ?? 'js').toLowerCase();
+    if (['js', 'javascript', 'ts', 'typescript'].includes(language)) {
+      blocks.push({ content: content.slice(i, match.index), extension: ['ts', 'typescript'].includes(language) ? '.ts' : '.js' });
+    }
+    i = close.lastIndex;
+  }
+  return blocks;
+}
+
+// A deliberately static object reader for Svelte config. Unknown expressions
+// stay unknown; config functions are never imported or executed.
+function staticConfigObject(raw) {
+  const tokens = jsTokens(raw);
+  function objectAt(start) {
+    const fields = new Map(); let depth = 0;
+    for (let i = start + 1; i < tokens.length; i++) {
+      const value = tokens[i].value;
+      if (value === '}' && depth === 0) break;
+      if (depth === 0 && ['word', 'string'].includes(tokens[i].type) && tokens[i + 1]?.value === ':') {
+        const next = tokens[i + 2];
+        fields.set(value, next?.value === '{' ? objectAt(i + 2) : next?.type === 'string' ? next.value : null);
+      }
+      if (['{', '(', '['].includes(value)) depth++;
+      if (['}', ')', ']'].includes(value)) depth--;
+    }
+    return fields;
+  }
+  const index = tokens.findIndex((t, i) => t.value === 'export' && tokens[i + 1]?.value === 'default');
+  if (index < 0) return null;
+  let start = index + 2;
+  if (tokens[start]?.type === 'word') {
+    const name = tokens[start].value;
+    const declaration = tokens.findIndex((t, i) => ['const', 'let', 'var'].includes(t.value) && tokens[i + 1]?.value === name && tokens[i + 2]?.value === '=');
+    if (declaration >= 0) start = declaration + 3;
+  }
+  return tokens[start]?.value === '{' ? objectAt(start) : null;
+}
+
+async function loadJsProjects(projectRoot, files) {
+  const packages = new Map(); const svelteProjects = new Map(); const warnings = []; const failures = [];
+  const candidates = files.map(f => toPosix(f.path)).filter(p => !p.split('/').includes('node_modules') && (posix.basename(p) === 'package.json' || /^svelte\.config\.(?:[cm]?js|ts)$/.test(posix.basename(p))));
+  const reads = await readFilesParallel(candidates.map(p => ({ key: p, absPath: join(projectRoot, p) })));
+  const manifests = new Map(); const configs = [];
+  for (const { key: path, raw, err } of reads) {
+    if (err) {
+      failures.push({ path, stage: 'resolver-config-read', message: err.message });
+      warnings.push(`Warning: extract-import-map: JS project config at ${join(projectRoot, path)} failed to read (${err.message})\n`);
+      continue;
+    }
+    if (posix.basename(path) !== 'package.json') { configs.push({ path, raw }); continue; }
+    let manifest;
+    try { manifest = JSON.parse(raw); } catch {
+      failures.push({ path, stage: 'resolver-config-parse', message: 'invalid package.json' });
+      warnings.push(`Warning: extract-import-map: package.json at ${join(projectRoot, path)} failed to parse — workspace imports from this manifest will not resolve\n`);
+      continue;
+    }
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) continue;
+    const dir = dirOf(path); manifests.set(dir, manifest);
+    if (typeof manifest.name === 'string' && manifest.name) {
+      if (!packages.has(manifest.name)) packages.set(manifest.name, []);
+      packages.get(manifest.name).push({ dir, manifest });
+    }
+    if ([manifest.dependencies, manifest.devDependencies, manifest.peerDependencies].some(deps => deps && Object.hasOwn(deps, '@sveltejs/kit'))) {
+      svelteProjects.set(dir, { lib: 'src/lib' });
+    }
+  }
+  for (const { path, raw } of configs) {
+    const dir = dirOf(path); const config = staticConfigObject(raw); const kit = config?.get('kit');
+    if (kit instanceof Map || svelteProjects.has(dir)) {
+      const files = kit instanceof Map ? kit.get('files') : null;
+      const lib = !config || (config.has('kit') && !(kit instanceof Map))
+        || (kit instanceof Map && kit.has('files') && !(files instanceof Map)) ? null
+        : files instanceof Map && files.has('lib') ? files.get('lib') : 'src/lib';
+      svelteProjects.set(dir, { lib });
+    } else svelteProjects.set(dir, { lib: null }); // A nearer non-Kit config is a project boundary.
+  }
+  return { packages, manifests, svelteProjects, warnings, failures };
+}
+
+function resolveWorkspacePackage(src, importerDir, ctx, mode = 'import') {
+  const parts = src.split('/');
+  const name = src.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
+  const candidates = ctx.jsPackages?.get(name);
+  if (!candidates?.length) return null;
+  const ownDir = findNearestConfigDir(importerDir, ctx.jsManifests);
+  const own = candidates.find(p => p.dir === ownDir);
+  const pkg = own ?? (candidates.length === 1 ? candidates[0] : null);
+  if (!pkg) return null; // Duplicate package names outside self scope are ambiguous.
+  const rest = src.slice(name.length); const subpath = rest ? '.' + rest : '.';
+  function target(value, wildcard = '') {
+    if (typeof value === 'string') {
+      if (!value.startsWith('./')) return null;
+      const path = posix.normalize(posix.join(pkg.dir, value.replaceAll('*', wildcard)));
+      if (path.startsWith('../') || (pkg.dir && !path.startsWith(pkg.dir + '/')) || path.split('/').includes('node_modules')) return null;
+      return probeWithExtensions(path, ctx.fileSet);
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) { const found = target(item, wildcard); if (found) return found; }
+    } else if (value && typeof value === 'object') {
+      for (const condition of ['source', 'svelte', mode, 'module', 'browser', 'default', 'types']) {
+        if (!Object.hasOwn(value, condition)) continue;
+        const found = target(value[condition], wildcard); if (found) return found;
+      }
+    }
+    return null;
+  }
+  const exports = pkg.manifest.exports;
+  if (Object.hasOwn(pkg.manifest, 'exports')) {
+    if (exports && typeof exports === 'object' && !Array.isArray(exports) && Object.keys(exports).some(key => key.startsWith('.'))) {
+      if (Object.hasOwn(exports, subpath)) return target(exports[subpath]);
+      const patterns = Object.keys(exports).filter(key => key.includes('*')).sort((a, b) => b.indexOf('*') - a.indexOf('*') || b.length - a.length || comparePaths(a, b));
+      for (const pattern of patterns) {
+        const wildcard = matchTsAlias(pattern, subpath);
+        if (wildcard !== null) return target(exports[pattern], wildcard);
+      }
+      return null;
+    }
+    return subpath === '.' ? target(exports) : null;
+  }
+  if (subpath !== '.') return probeWithExtensions(resolveRelative(pkg.dir, rest.slice(1)), ctx.fileSet);
+  for (const field of ['source', 'svelte', 'module', 'main', 'types']) {
+    const value = pkg.manifest[field];
+    if (typeof value !== 'string') continue;
+    const found = target(value.startsWith('./') ? value : './' + value);
+    if (found) return found;
+  }
+  return probeWithExtensions(posix.join(pkg.dir, 'index'), ctx.fileSet);
+}
+
 async function buildResolutionContext(projectRoot, files) {
   const fileSet = new Set(files.map(f => toPosix(f.path)));
 
@@ -604,16 +844,18 @@ async function buildResolutionContext(projectRoot, files) {
   // flaky. Drain the buffers in canonical order *after* Promise.all, so
   // a fixture with `(malformed tsconfig.json, malformed composer.json)`
   // always emits `tsconfig…\ncomposer…\n`, never the reverse.
-  const [tsResult, goResult, phpResult, swiftResult] = await Promise.all([
+  const [tsResult, goResult, phpResult, swiftResult, jsResult] = await Promise.all([
     loadTsConfigs(projectRoot, files),
     loadGoModules(projectRoot, files),
     loadPhpAutoloads(projectRoot, files),
     loadSwiftPackageTargets(projectRoot, files),
+    loadJsProjects(projectRoot, files),
   ]);
   for (const w of tsResult.warnings) process.stderr.write(w);
   for (const w of goResult.warnings) process.stderr.write(w);
   for (const w of phpResult.warnings) process.stderr.write(w);
   for (const w of swiftResult.warnings) process.stderr.write(w);
+  for (const w of jsResult.warnings) process.stderr.write(w);
   const tsConfigs = tsResult.configs;
   const goModules = goResult.modules;
   const phpAutoloads = phpResult.autoloads;
@@ -646,6 +888,9 @@ async function buildResolutionContext(projectRoot, files) {
     projectRoot,
     fileSet,
     tsConfigs,
+    jsPackages: jsResult.packages,
+    jsManifests: jsResult.manifests,
+    svelteProjects: jsResult.svelteProjects,
     goModules,
     goFilesByDir,
     javaIndex,
@@ -659,6 +904,7 @@ async function buildResolutionContext(projectRoot, files) {
       ...goResult.failures,
       ...phpResult.failures,
       ...swiftResult.failures,
+      ...jsResult.failures,
     ],
     phpAutoloads,
     // Dedupe Sets for one-time-per-file warnings. Keyed by importer file
@@ -683,8 +929,8 @@ async function buildResolutionContext(projectRoot, files) {
 // Extensions probed when the import has no extension. The order mirrors the
 // historical project-scanner prose so behavior matches existing fixtures.
 const TS_EXT_PROBES = [
-  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '/index.ts', '/index.tsx', '/index.js', '/index.jsx',
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts', '.svelte', '.json',
+  '/index.ts', '/index.tsx', '/index.js', '/index.jsx', '/index.mts', '/index.cts', '/index.mjs', '/index.cjs', '/index.svelte',
 ];
 
 /**
@@ -752,9 +998,13 @@ function probeWithExtensions(basePath, fileSet) {
  * targets are anchored at THAT tsconfig's directory, matching the way the
  * TypeScript compiler resolves nested project configs.
  */
-export function resolveTsJsImport(rawImport, file, ctx) {
+export function resolveTsJsImport(rawImport, file, ctx, mode = 'import') {
   if (!rawImport || typeof rawImport !== 'string') return null;
-  const src = rawImport.trim();
+  const rawSource = rawImport.trim();
+  // Bundler suffixes select transforms, not different source files. Keep
+  // package-import names starting with # intact.
+  const suffix = rawSource.search(/[?#]/);
+  const src = suffix > 0 ? rawSource.slice(0, suffix) : rawSource;
   if (!src) return null;
 
   const importerDir = dirOf(toPosix(file.path));
@@ -807,8 +1057,24 @@ export function resolveTsJsImport(rawImport, file, ctx) {
     }
   }
 
-  // Bare specifier with no leading `./`, no alias match -> external package.
-  return null;
+  // SvelteKit's generated tsconfig is commonly excluded from the inventory.
+  // Resolve its built-in $lib alias only inside the closest known Kit project.
+  if (src === '$lib' || src.startsWith('$lib/')) {
+    const kitDir = findNearestConfigDir(importerDir, ctx.svelteProjects ?? new Map());
+    if (kitDir !== undefined) {
+      const lib = ctx.svelteProjects.get(kitDir).lib;
+      if (typeof lib === 'string') {
+        const base = resolveRelative(kitDir, lib);
+        const candidate = base && probeWithExtensions(posix.join(base, src === '$lib' ? '' : src.slice(5)), ctx.fileSet);
+        if (candidate) return candidate;
+      }
+    }
+    return null;
+  }
+
+  // Named packages resolve only through inventoried local manifests. No
+  // node_modules traversal or filesystem guesses for external dependencies.
+  return resolveWorkspacePackage(src, importerDir, ctx, mode);
 }
 
 /**
@@ -853,7 +1119,6 @@ function applyTsAlias(target, wildcard) {
  *   - Template-literal requires are unresolved.
  *   - String concatenation in the argument is unresolved.
  */
-const REQUIRE_LITERAL_RE = /\brequire\(\s*(['"])([^'"`\n]+?)\1\s*\)/g;
 
 /**
  * Strip JS/TS line and block comments before running text-pattern matchers.
@@ -869,16 +1134,6 @@ function stripJsLikeComments(content) {
     .replace(/\/\/[^\n]*/g, '');
 }
 
-function extractRequireSources(content) {
-  const sources = [];
-  let m;
-  const stripped = stripJsLikeComments(content);
-  REQUIRE_LITERAL_RE.lastIndex = 0;
-  while ((m = REQUIRE_LITERAL_RE.exec(stripped)) !== null) {
-    sources.push(m[2]);
-  }
-  return sources;
-}
 
 /**
  * Kotlin has no tree-sitter extractor in this project, so we collect its
@@ -1889,7 +2144,7 @@ export function resolveCppImport(rawImport, file, ctx) {
  * source through the matching resolver.
  */
 const TS_JS_LANGS = new Set([
-  'typescript', 'javascript', 'tsx', 'jsx', 'vue',
+  'typescript', 'javascript', 'tsx', 'jsx', 'vue', 'svelte', 'mts', 'cts',
 ]);
 
 /**
@@ -1904,8 +2159,8 @@ const TS_JS_LANGS = new Set([
 function resolveImport(imp, file, ctx) {
   const lang = file.language;
   const src = imp.source;
-  if (TS_JS_LANGS.has(lang)) {
-    const out = resolveTsJsImport(src, file, ctx);
+  if (TS_JS_LANGS.has(lang) || file.path.endsWith('.svelte')) {
+    const out = resolveTsJsImport(src, file, ctx, imp.kind === 'require' ? 'require' : 'import');
     return out ? [out] : [];
   }
   if (lang === 'python') {
@@ -1950,8 +2205,8 @@ function resolveImport(imp, file, ctx) {
  * import-source strings to be passed through resolveImport().
  */
 function extractExtraImportSources(file, content) {
-  if (TS_JS_LANGS.has(file.language)) {
-    return extractRequireSources(content);
+  if (TS_JS_LANGS.has(file.language) || file.path.endsWith('.svelte')) {
+    return extractJsModuleSources(content);
   }
   if (file.language === 'kotlin') {
     return extractKotlinSources(content);
@@ -2041,7 +2296,7 @@ async function main() {
     const path = toPosix(file.path);
 
     // Non-code files always get an empty array
-    if (file.fileCategory !== 'code') {
+    if (file.fileCategory !== 'code' && file.language !== 'svelte' && !file.path.endsWith('.svelte')) {
       importMap[path] = [];
       continue;
     }
@@ -2086,8 +2341,19 @@ async function main() {
           }
         }
       } else {
-        const analysis = registry.analyzeFile(file.path, content);
-        const imports = analysis?.imports ?? [];
+        const blocks = file.language === 'svelte' || file.path.endsWith('.svelte')
+          ? svelteScripts(content)
+          : [{ content, extension: null }];
+        const imports = [];
+        for (const block of blocks) {
+          const parsePath = block.extension ? file.path + block.extension
+            : file.language === 'mts' || file.language === 'cts' ? file.path + '.ts' : file.path;
+          const analysis = registry.analyzeFile(parsePath, block.content);
+          imports.push(...(analysis?.imports ?? []));
+          for (const extra of extractExtraImportSources(file, block.content)) {
+            imports.push(typeof extra === 'string' ? { source: extra, specifiers: [] } : { ...extra, specifiers: [] });
+          }
+        }
         for (const imp of imports) {
           const outs = resolveImport(imp, file, ctx);
           for (const out of outs) {
@@ -2096,16 +2362,7 @@ async function main() {
             }
           }
         }
-        // Supplemental pass for sources tree-sitter doesn't capture (e.g.
-        // CJS require() calls, Kotlin imports). Dedup via the same set.
-        for (const extra of extractExtraImportSources(file, content)) {
-          const outs = resolveImport({ source: extra, specifiers: [] }, file, ctx);
-          for (const out of outs) {
-            if (out && ctx.fileSet.has(out)) {
-              resolvedSet.add(out);
-            }
-          }
-        }
+
       }
       resolved = [...resolvedSet].sort((a, b) =>
         file.language === 'scala'
